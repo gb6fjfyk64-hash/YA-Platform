@@ -1,0 +1,127 @@
+# Boutique-Style Luxury E-Commerce Platform
+
+## Context
+
+The user wants to build a new online shopping platform for luxury goods (perfumes, watches, accessories), targeting the Qatar/Gulf (GCC) market. They provided a reference design, `JZ.pdf` — screenshots of **Boutique JZ** (boutiquejz.com), a minimalist luxury storefront: 4-column product grid, editorial product naming, QAR/KWD multi-currency, English/Arabic multi-language, circular monogram branding, generous whitespace, plus a companion mobile app (out of scope here).
+
+Confirmed requirements:
+- Custom-coded web app (not Shopify) — full control
+- Stack: **Next.js (App Router) + TypeScript**
+- Database + Auth: **Supabase** (Postgres, Auth, Storage)
+- Payments: **MyFatoorah** (GCC payment gateway — supports QAR, KWD, SAR, AED, BHD, OMR)
+- Multi-currency (QAR primary) and multi-language (English + Arabic with RTL)
+- Features: cart & checkout with real payments, user accounts & order history, admin panel for products/orders
+- Stage: **MVP first**, architected to grow into production without a rewrite
+
+**Setup issue to fix first:** the current working directory (`C:\Users\ialma\OneDrive\Documents\IA\AI\Sales Platform`) has no git repo of its own — `git status` resolves up to `C:\Users\ialma` (the Windows profile root), an uninitialized repo that would track the entire home directory if used. A project-scoped `git init` + `.gitignore` must happen before any commits.
+
+## Phase 0 — Scaffolding
+
+1. `git init` inside the project folder (nested repos are fine, inner `.git` wins for files under it); add `.gitignore` (node_modules, `.env*.local`, `.next`, `.vercel`) **before** the first `git add`.
+2. `create-next-app`: App Router, TypeScript, Tailwind CSS, ESLint, `src/` dir, `@/*` import alias.
+3. Core deps: `@supabase/supabase-js`, `@supabase/ssr`, `next-intl`, `zod`, `zustand` (cart state), `clsx`/`tailwind-merge`.
+4. Folder layout — locale-prefixed routing from day one (`[locale]` is painful to retrofit later):
+
+```
+src/
+  app/
+    [locale]/
+      (storefront)/
+        page.tsx                          # home
+        collections/[slug]/page.tsx        # 4-col product grid
+        products/[slug]/page.tsx           # product detail
+        cart/page.tsx
+        checkout/page.tsx
+        checkout/confirmation/page.tsx
+        account/page.tsx
+        account/orders/[id]/page.tsx
+        layout.tsx                         # header, currency/lang switcher, footer
+      (admin)/admin/
+        layout.tsx                         # role-gated shell
+        page.tsx                           # dashboard
+        products/page.tsx, products/[id]/page.tsx, products/new/page.tsx
+        orders/page.tsx, orders/[id]/page.tsx
+      layout.tsx                           # sets <html dir="rtl|ltr">
+    api/
+      checkout/create-payment/route.ts
+      webhooks/myfatoorah/route.ts
+  components/{storefront,admin,ui}/
+  lib/
+    supabase/{client.ts,server.ts,middleware.ts,admin.ts}
+    myfatoorah/{client.ts,webhook.ts}
+    currency.ts
+    cart.ts
+    i18n/request.ts
+  messages/{en.json,ar.json}
+  types/{database.ts,domain.ts}
+  middleware.ts                            # chains next-intl + Supabase session
+supabase/
+  migrations/0001_init.sql, 0002_rls_policies.sql
+  seed.sql
+```
+
+**Styling:** Tailwind with a custom token layer — restrained neutral palette (off-white, near-black, one accent like bronze/gold), a serif display font for product names paired with a clean sans for UI chrome, generous grid spacing. Hand-build the small set of primitives needed (Button, Dropdown, Badge) rather than pulling in shadcn's default look — the reference is too spare for shadcn's default card/shadow treatment. Use Tailwind logical-property utilities (`ps-`, `pe-`, `text-start/end`) everywhere instead of `left/right` — required for RTL later.
+
+## Phase 1 — Data model & Auth (Supabase)
+
+Tables (all RLS-enabled): `profiles` (role: customer/admin, preferred locale/currency), `categories` (bilingual name), `products` (bilingual name/description, `base_price_qar`, `product_type`), `product_images` (Supabase Storage path), `product_variants` (volume/size, price delta, stock), `currencies` (code, symbol, decimal_places — KWD/BHD/OMR use 3 decimals), `exchange_rates` (admin-editable `rate_to_qar`), `addresses`, `orders` (status enum, currency, `total_qar` + `total_display` + `exchange_rate_used` snapshot, MyFatoorah invoice/payment IDs), `order_items` (price/name snapshots), `payment_events` (webhook audit log).
+
+RLS: public read on active catalog rows; admin-only writes via `is_admin()` helper checking `profiles.role`; orders/order_items readable only by owner or admin, writable only via service-role server routes (never direct client insert — orders must tie to verified payment); `payment_events` has no client access.
+
+Auth: Supabase Auth (email/password for MVP). Admin role set manually in DB for the first account — no self-serve admin signup. Admin gate enforced server-side in `(admin)/admin/layout.tsx`, not just middleware. Guest checkout supported (`orders.profile_id` nullable + `guest_email`).
+
+## Phase 2 — Storefront pages
+
+Home (hero, featured grid, category tiles) → Collection listing (4-col responsive grid matching the reference, `ProductCard` with image/name/price/add-to-cart) → Product detail (gallery, variant selector, qty, add-to-cart) → Cart (client-side via zustand + localStorage, no DB table needed for MVP) → Checkout (address form, order summary, "Pay with MyFatoorah") → Confirmation → Account (profile, addresses, order history).
+
+## Phase 3 — Cart, Checkout, Payments (MyFatoorah)
+
+1. Checkout submit → `POST /api/checkout/create-payment` — server re-validates cart against live DB prices (never trust client prices).
+2. Server creates `orders` (status `pending_payment`) + `order_items` via service-role client, computes total using `exchange_rates`.
+3. Calls MyFatoorah `InitiatePayment`/`ExecutePayment` with invoice value, currency, customer info, `CallBackUrl`/`ErrorUrl`, `CustomerReference` = order number. Stores `InvoiceId`, redirects to MyFatoorah's hosted payment page.
+4. Webhook (`/api/webhooks/myfatoorah/route.ts`): verify signature, log raw payload to `payment_events`, call `GetPaymentStatus` server-side to confirm authoritative status (don't trust webhook body alone), update `orders.status`/`paid_at`.
+5. Confirmation page reads order status from DB, not URL params.
+6. Env-driven sandbox/production switch (`MYFATOORAH_MODE=test|live`, different base URLs).
+
+## Phase 4 — Admin panel (`/admin`, same app, protected)
+
+Single app for MVP (shared components, one deploy/auth system). Dashboard (order counts, revenue, low stock), Products CRUD (bilingual fields, variants sub-form, image upload to Supabase Storage `product-images` bucket with admin-only write policy), Orders (list + detail + manual status transitions: pending → processing → shipped → delivered). Non-admin/unauthenticated hitting `/admin` → redirect/404 (prefer 404 to avoid revealing the route).
+
+## Phase 5 — Multi-currency
+
+All money stored in QAR (`base_price_qar`, `unit_price_qar`, etc.) as canonical value. `lib/currency.ts` converts for display using `exchange_rates.rate_to_qar`, formats via `Intl.NumberFormat` with per-currency decimal places (2 for QAR/SAR/AED, 3 for KWD/BHD/OMR — don't hardcode 2). Rates are admin-editable, static for MVP (no live FX API — unnecessary dependency for a low-SKU catalog). Verify MyFatoorah's supported currency list before hardcoding it. Orders snapshot both `total_qar` and `total_display`/`exchange_rate_used` so historical orders don't reprice if rates change later.
+
+## Phase 6 — Multi-language / RTL
+
+`next-intl` for `[locale]` segment routing (`/en`, `/ar`), middleware chains locale resolution + Supabase session. UI strings in `messages/en.json`/`ar.json` (admin UI can stay English-only for MVP — internal users). Product content stored as direct bilingual columns (`name_en`/`name_ar` etc.) rather than a separate translations table — adequate for exactly 2 languages; note as a known future migration if a 3rd language is ever needed. Root layout sets `dir="rtl"` for Arabic. RTL discipline (logical properties, `rtl:` icon-flip variants) applied from Phase 2 onward, not bolted on later. Confirm chosen fonts have Arabic glyph coverage or pair a dedicated Arabic font.
+
+## Phase 7 — Environment
+
+`.env.local` (gitignored): `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY` (server-only), `MYFATOORAH_API_KEY`, `MYFATOORAH_MODE`, `MYFATOORAH_WEBHOOK_SECRET`, `NEXT_PUBLIC_SITE_URL`. Commit a `.env.example` with keys but no values.
+
+## Phase 8 — MVP-to-production checklist (explicitly deferred, not forgotten)
+
+Swap MyFatoorah sandbox → production keys; replace seed data with real catalog/photography/copy; add transactional emails (order confirmation/shipping); add inventory decrement/oversell protection + low-stock alerts; add API rate limiting; add legal pages (Terms, Privacy, Return/Shipping Policy — required for real GCC launch); expand admin (bulk actions, CSV export, analytics); shipping-carrier integration; consider live FX API; add integration tests around checkout/webhook (highest financial risk path); add error monitoring (Sentry) + structured logging on the webhook handler. Mobile companion app is out of scope for this plan.
+
+## Verification plan
+
+1. `npm run dev`, confirm `/en` and `/ar` load with correct RTL flip.
+2. Run `supabase/seed.sql`, set own account `profiles.role = 'admin'`.
+3. Browse collection grid — 4 columns, images from Supabase Storage, QAR prices.
+4. Switch currency to KWD — confirm reconversion + 3-decimal formatting.
+5. Add to cart, adjust quantity, checkout with address, submit — confirm `orders`/`order_items` created as `pending_payment`, redirect to MyFatoorah sandbox.
+6. Complete payment with MyFatoorah's sandbox test card.
+7. Confirm redirect to confirmation page, `payment_events` logged, `orders.status` → `paid`.
+8. Check `/account/orders` shows the order correctly.
+9. Check `/admin/orders` shows the same order, manually transition status, confirm it reflects on the customer side.
+10. Create a product via `/admin/products/new` with EN+AR fields + image, confirm it appears in both locale storefronts.
+11. Confirm a non-admin logged-in user is blocked from `/admin`.
+
+## Critical files
+
+- `supabase/migrations/0001_init.sql` — the entire data model
+- `src/middleware.ts` — chains i18n routing + auth session; bugs here break the whole app
+- `src/lib/myfatoorah/client.ts` — payment integration, highest financial-risk surface
+- `src/app/api/webhooks/myfatoorah/route.ts` — authoritative order-status transition, must verify signature + re-fetch status
+- `src/lib/currency.ts` — conversion/formatting used across storefront, cart, checkout, orders
+- `src/components/storefront/ProductGrid.tsx` / `ProductCard.tsx` — the reference's signature 4-column grid
